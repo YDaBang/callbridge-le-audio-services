@@ -18,7 +18,7 @@ import (
 	"callbridge.local/callbridge-sms-go/lecall/internal/protocol"
 )
 
-const version = "0.1.0-v32"
+const version = "0.1.0-v35"
 
 type options struct {
 	mode               string
@@ -90,10 +90,30 @@ func runServe(parent context.Context, configured options) error {
 	logger := log.New(os.Stderr, "le-call-go: ", log.Ldate|log.Ltime|log.LUTC)
 	store := gtbs.NewStore()
 	var controlServer *control.Server
+	var mediaBroker *bluez.Broker
+	var droppedForToken uint64
 	client, err := gtbs.NewClient(configured.adapter, configured.device, store, logger, gtbs.Callbacks{
 		Snapshot: func(snapshot gtbs.Snapshot) {
 			if controlServer != nil {
 				controlServer.BroadcastSnapshot(snapshot)
+			}
+			// Hand a handset-answered call back to the phone: hold the
+			// advertisement so it cannot reconnect, then drop the link.
+			// Dropping once per token, because the phone re-offers the
+			// stream and every snapshot would otherwise drop again.
+			if mediaBroker == nil {
+				return
+			}
+			token := store.HandsetAnswered()
+			mediaBroker.HoldAdvertisement(token != 0)
+			if token == 0 {
+				droppedForToken = 0
+				return
+			}
+			if token != droppedForToken {
+				droppedForToken = token
+				broker := mediaBroker
+				go broker.DropLEBearer("handset_answered_call")
 			}
 		},
 		Ready: func(ready bool) {
@@ -110,7 +130,7 @@ func runServe(parent context.Context, configured options) error {
 	if err != nil {
 		return err
 	}
-	mediaBroker, err := bluez.NewBroker(configured.adapter, configured.device,
+	mediaBroker, err = bluez.NewBroker(configured.adapter, configured.device,
 		configured.mediaSocket, configured.peerUID, logger)
 	if err != nil {
 		return err
@@ -128,6 +148,12 @@ func runServe(parent context.Context, configured options) error {
 	command := func(ctx context.Context, message protocol.Message) error {
 		if message.Code == protocol.OpcodeTerminate {
 			mediaBroker.ReleaseCallToken(message.Token)
+		}
+		if message.Code == protocol.OpcodeAccept {
+			// Claim before the write: the phone can notify Active before
+			// this call returns, and an unclaimed Active is treated as a
+			// handset answer.
+			store.ClaimCall(message.Index, message.Token)
 		}
 		return client.Command(ctx, message)
 	}

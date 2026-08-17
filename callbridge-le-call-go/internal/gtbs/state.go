@@ -38,6 +38,7 @@ type Snapshot struct {
 type Store struct {
 	mu       sync.RWMutex
 	calls    map[byte]Call
+	claimed  map[byte]uint64
 	sequence uint64
 	seed     uint64
 	tokens   atomic.Uint64
@@ -48,7 +49,8 @@ func NewStore() *Store {
 	if seed == 0 {
 		seed = 1
 	}
-	store := &Store{calls: make(map[byte]Call), sequence: seed, seed: seed}
+	store := &Store{calls: make(map[byte]Call), claimed: make(map[byte]uint64),
+		sequence: seed, seed: seed}
 	store.tokens.Store(seed)
 	return store
 }
@@ -90,11 +92,48 @@ func (s *Store) Apply(value []byte) (Snapshot, error) {
 		next[call.Index] = call
 	}
 	s.calls = next
+	for index, token := range s.claimed {
+		if call, present := next[index]; !present || call.Token != token {
+			delete(s.claimed, index)
+		}
+	}
 	s.sequence++
 	if s.sequence == 0 {
 		s.sequence = 1
 	}
 	return snapshotLocked(s.sequence, s.calls), nil
+}
+
+// HandsetAnswered reports the token of a call the phone answered by itself: an
+// incoming call that left the Incoming state without an Accept from this side.
+// Returns 0 when there is no such call.
+func (s *Store) HandsetAnswered() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, call := range s.calls {
+		if call.Token == 0 || call.Flags&CallFlagOutgoing != 0 ||
+			call.State == StateIncoming {
+			continue
+		}
+		if s.claimed[call.Index] != call.Token {
+			return call.Token
+		}
+	}
+	return 0
+}
+
+// ClaimCall records that this side asked for the call, so the media path may
+// carry it. Only an Accept we sent counts; the phone answering on its own does
+// not, and neither does a stale index whose token has since been reissued.
+func (s *Store) ClaimCall(index byte, token uint64) {
+	if token == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if call, present := s.calls[index]; present && call.Token == token {
+		s.claimed[index] = token
+	}
 }
 
 func (s *Store) Snapshot() Snapshot {
@@ -119,7 +158,22 @@ func (s *Store) CurrentCallToken() (uint64, bool) {
 		return 0, false
 	}
 	for _, call := range s.calls {
-		return call.Token, call.Token != 0
+		if call.Token == 0 {
+			return 0, false
+		}
+		// An incoming call that reached a connected state without an Accept
+		// from this side was answered on the handset. The phone routes call
+		// audio to whichever LE Audio device accepts a stream, so refusing
+		// the correlation here keeps the media broker from acquiring the
+		// transport and leaves the audio where the user answered it.
+		//
+		// Outgoing calls are untouched: this side originated them.
+		if call.Flags&CallFlagOutgoing == 0 && call.State != StateIncoming {
+			if s.claimed[call.Index] != call.Token {
+				return 0, false
+			}
+		}
+		return call.Token, true
 	}
 	return 0, false
 }

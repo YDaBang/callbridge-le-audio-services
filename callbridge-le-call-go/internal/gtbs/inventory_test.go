@@ -7,7 +7,7 @@ import (
 )
 
 func TestDiscoverRequiresWritableNotifiableGTBSControl(t *testing.T) {
-	device := dbus.ObjectPath("/org/bluez/hci0/dev_6C_AC_C2_0D_40_88")
+	device := dbus.ObjectPath("/org/bluez/hci0/dev_00_11_22_33_44_55")
 	service := dbus.ObjectPath(string(device) + "/service001")
 	callState := dbus.ObjectPath(string(service) + "/char001")
 	control := dbus.ObjectPath(string(service) + "/char002")
@@ -37,7 +37,7 @@ func TestDiscoverRequiresWritableNotifiableGTBSControl(t *testing.T) {
 
 func TestDevicePath(t *testing.T) {
 	path, err := DevicePath("hci0", "00:11:22:33:44:55")
-	if err != nil || path != "/org/bluez/hci0/dev_6C_AC_C2_0D_40_88" {
+	if err != nil || path != "/org/bluez/hci0/dev_00_11_22_33_44_55" {
 		t.Fatalf("path=%q err=%v", path, err)
 	}
 }
@@ -63,7 +63,7 @@ func TestResolveDevicePathRejectsAmbiguousIdentity(t *testing.T) {
 	}
 	objects := ManagedObjects{
 		"/org/bluez/hci0/dev_5B_3B_C8_E0_A8_C2": {DeviceIface: properties},
-		"/org/bluez/hci0/dev_6C_AC_C2_0D_40_88": {DeviceIface: properties},
+		"/org/bluez/hci0/dev_00_11_22_33_44_55": {DeviceIface: properties},
 	}
 	if _, err := ResolveDevicePath(objects, "hci0", "00:11:22:33:44:55"); err == nil {
 		t.Fatal("accepted ambiguous BlueZ identity")

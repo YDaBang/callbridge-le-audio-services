@@ -82,6 +82,9 @@ type Broker struct {
 	expectedAddress string
 	expectedDevice  string
 	logger          *log.Logger
+
+	advertisementHold bool
+	rearmRequest      chan struct{}
 	handoff         *HandoffServer
 
 	mu                     sync.Mutex
@@ -251,6 +254,7 @@ func NewBroker(adapter, device, socket string, peerUID int, logger *log.Logger) 
 		configured: make(map[dbus.ObjectPath]transportConfig), acquiring: make(map[dbus.ObjectPath]bool),
 		acquired: make(map[dbus.ObjectPath]bool), pairing: make(map[dbus.ObjectPath]bool),
 		pending:            make(map[dbus.ObjectPath]*pendingTransport),
+		rearmRequest:       make(chan struct{}, 1),
 		releaseInvoker:     invokeTransportRelease,
 		releaseFallback:    closeTransportOwnerConnection,
 		releaseRetryDelay:  transportReleaseRetryDelay,
@@ -556,6 +560,21 @@ func (b *Broker) runBlueZOnce(ctx context.Context, handoffErr <-chan error) erro
 			return nil
 		case err := <-handoffErr:
 			return wrapHandoffFailure(err)
+		case <-b.rearmRequest:
+			// The hold was released after the handset call ended. The
+			// disconnect that would normally rearm is long past, so do it
+			// here, and only if the phone is still away.
+			connected, readErr := readLEBearerConnected(conn, devicePath)
+			if readErr != nil {
+				return fmt.Errorf("read LE bearer state for rearm: %w", readErr)
+			}
+			if connected || b.advertisementHeld() {
+				continue
+			}
+			if err := setAdvertisement(true); err != nil {
+				return fmt.Errorf("rearm targeted advertisement after hold: %w", err)
+			}
+			b.logger.Printf("le audio targeted advertisement rearmed reason=handset_call_ended")
 		case <-conn.Context().Done():
 			return errors.New("BlueZ system bus disconnected")
 		case signal := <-signals:
@@ -573,6 +592,15 @@ func (b *Broker) runBlueZOnce(ctx context.Context, handoffErr <-chan error) erro
 					b.logger.Printf("le audio targeted advertisement stopped reason=le_connected")
 				} else {
 					b.handleLEBearerDisconnected()
+					// The phone never initiates on its own: in every
+					// observed reconnect it answered this advertisement.
+					// So while a call the handset answered is still up,
+					// holding the advertisement is what keeps the audio
+					// on the phone -- rearming immediately hands it back.
+					if b.advertisementHeld() {
+						b.logger.Printf("le audio targeted advertisement held reason=handset_answered_call")
+						continue
+					}
 					if err := setAdvertisement(true); err != nil {
 						return fmt.Errorf("rearm targeted advertisement after LE disconnect: %w", err)
 					}
@@ -1887,6 +1915,60 @@ func (b *Broker) handleLEBearerDisconnected() bool {
 // old channel from changing a newer call that reused the same transports. The
 // D-Bus owner is kept only for the bounded remote-IDLE window; abnormal HUP,
 // lease, protocol, and bearer failures still bypass this wait.
+// HoldAdvertisement suspends or resumes the targeted advertisement.
+//
+// Dropping the LE link is only half of handing a call back to the handset. The
+// phone does not initiate: in every reconnect observed it answered this
+// advertisement, taking about five seconds, and then took the audio again. So
+// the advertisement has to stay down until the call ends, and releasing the
+// hold has to rearm it, because the disconnect signal that would normally do
+// so has long since passed.
+func (b *Broker) HoldAdvertisement(hold bool) {
+	b.mu.Lock()
+	changed := b.advertisementHold != hold
+	b.advertisementHold = hold
+	rearm := b.rearmRequest
+	b.mu.Unlock()
+	if !changed || hold || rearm == nil {
+		return
+	}
+	select {
+	case rearm <- struct{}{}:
+	default:
+	}
+}
+
+func (b *Broker) advertisementHeld() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.advertisementHold
+}
+
+// DropLEBearer disconnects the phone's LE link.
+//
+// Refusing the stream is not enough to hand a call back to the handset: the
+// phone decides where call audio goes when the LE Audio device connects, and it
+// keeps re-offering the stream rather than re-routing when every offer is
+// declined. Removing the device is what makes it fall back to its own earpiece.
+// The targeted advertisement rearms on disconnect, so the phone reconnects
+// without help; measured recovery to GTBS ready was about five seconds.
+func (b *Broker) DropLEBearer(reason string) bool {
+	b.mu.Lock()
+	conn := b.connection
+	path := b.expectedDevice
+	b.mu.Unlock()
+	if conn == nil || path == "" {
+		return false
+	}
+	if err := resetLEBearer(conn, dbus.ObjectPath(path)); err != nil {
+		b.logger.Printf("le audio bearer drop skipped reason=%s error=%v",
+			reason, err)
+		return false
+	}
+	b.logger.Printf("le audio bearer dropped reason=%s", reason)
+	return true
+}
+
 func (b *Broker) ReleaseCallToken(token uint64) bool {
 	if token == 0 {
 		return false

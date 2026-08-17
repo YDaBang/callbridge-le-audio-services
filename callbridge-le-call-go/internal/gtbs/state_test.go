@@ -45,6 +45,95 @@ func TestStoreRefusesAmbiguousMediaCorrelation(t *testing.T) {
 	}
 }
 
+func TestStoreRefusesMediaForAHandsetAnsweredCall(t *testing.T) {
+	store := NewStore()
+	ringing, err := store.Apply([]byte{4, StateIncoming, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := ringing.Calls[0].Token
+	if got, ok := store.CurrentCallToken(); !ok || got != token {
+		t.Fatalf("a ringing call must still correlate: token=%d ok=%v", got, ok)
+	}
+
+	// Active with no Accept from this side: the handset answered.
+	if _, err := store.Apply([]byte{4, StateActive, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := store.CurrentCallToken(); ok || got != 0 {
+		t.Fatalf("handset answer must refuse media: token=%d ok=%v", got, ok)
+	}
+
+	// The same call once this side accepts it.
+	store.ClaimCall(4, token)
+	if got, ok := store.CurrentCallToken(); !ok || got != token {
+		t.Fatalf("accepted call must correlate: token=%d ok=%v", got, ok)
+	}
+
+	// A claim cannot survive the call going away and the index returning.
+	if _, err := store.Apply(nil); err != nil {
+		t.Fatal(err)
+	}
+	next, err := store.Apply([]byte{4, StateActive, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Calls[0].Token == token {
+		t.Fatal("lifecycle token was reused")
+	}
+	if got, ok := store.CurrentCallToken(); ok || got != 0 {
+		t.Fatalf("stale claim leaked to a new call: token=%d ok=%v", got, ok)
+	}
+}
+
+func TestHandsetAnsweredReportsOnlyAnUnclaimedIncomingCall(t *testing.T) {
+	store := NewStore()
+	ringing, err := store.Apply([]byte{3, StateIncoming, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := ringing.Calls[0].Token
+	if got := store.HandsetAnswered(); got != 0 {
+		t.Fatalf("a ringing call is not answered yet: %d", got)
+	}
+	if _, err := store.Apply([]byte{3, StateActive, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.HandsetAnswered(); got != token {
+		t.Fatalf("unclaimed active call: got=%d want=%d", got, token)
+	}
+	store.ClaimCall(3, token)
+	if got := store.HandsetAnswered(); got != 0 {
+		t.Fatalf("an accepted call must not look like a handset answer: %d", got)
+	}
+
+	// Outgoing calls reach Active without any Accept and must never match.
+	outgoing := NewStore()
+	if _, err := outgoing.Apply([]byte{5, StateActive, CallFlagOutgoing}); err != nil {
+		t.Fatal(err)
+	}
+	if got := outgoing.HandsetAnswered(); got != 0 {
+		t.Fatalf("outgoing call reported as a handset answer: %d", got)
+	}
+}
+
+func TestStoreCorrelatesOutgoingCallsWithoutAClaim(t *testing.T) {
+	store := NewStore()
+	dialing, err := store.Apply([]byte{9, StateDialing, CallFlagOutgoing})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := dialing.Calls[0].Token
+	for _, state := range []byte{StateAlerting, StateActive} {
+		if _, err := store.Apply([]byte{9, state, CallFlagOutgoing}); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := store.CurrentCallToken(); !ok || got != token {
+			t.Fatalf("outgoing state=%d token=%d ok=%v", state, got, ok)
+		}
+	}
+}
+
 func TestParseCallStateRejectsMalformedEntries(t *testing.T) {
 	for _, value := range [][]byte{
 		{1},

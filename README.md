@@ -41,7 +41,23 @@ peer UID.  Every media handoff has to carry the token of exactly one live call;
 ambiguous multi-call state fails closed rather than guessing, because the
 process never infers a cellular answer or hangup from media alone.
 
-Two behaviours are worth knowing before you debug something:
+Three behaviours are worth knowing before you debug something:
+
+**A call answered on the handset is given back to the phone.**  Android decides
+where call audio goes when an LE Audio device is connected, and it does not
+reconsider: refuse the stream and it re-offers the same stream while nothing
+plays anywhere.  So when GTBS reports a call leaving `Incoming` without an
+Accept from this side, the broker holds the advertisement and then drops the LE
+link, and the phone falls back to its own earpiece.
+
+Order matters.  Dropping before holding rearms the advertisement on the
+disconnect signal, the phone answers it about five seconds later, and the bridge
+takes the audio again — which is exactly the bug.  Releasing the hold has to
+rearm explicitly, because by then the disconnect signal is long past.
+
+Outgoing calls are excluded by the GTBS outgoing flag: this side originated
+them, so no Accept is expected and none is required.
+
 
 **Advertising is targeted and conditional.**  BAP and CAP Targeted Announcements
 run only while the phone's LE bearer is disconnected.  The design has the bonded
