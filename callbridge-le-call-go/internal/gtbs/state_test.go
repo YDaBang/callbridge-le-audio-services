@@ -1,6 +1,7 @@
 package gtbs
 
 import (
+	"errors"
 	"testing"
 
 	"callbridge.local/callbridge-sms-go/lecall/internal/protocol"
@@ -145,5 +146,90 @@ func TestParseCallStateRejectsMalformedEntries(t *testing.T) {
 		if _, err := ParseCallState(value); err == nil {
 			t.Fatalf("accepted %x", value)
 		}
+	}
+}
+
+func TestStripURISchemeKeepsOnlyDialableStrings(t *testing.T) {
+	for input, want := range map[string]string{
+		"tel:+821000000000":             "+821000000000",
+		"sip:+821000000000":             "+821000000000",
+		"+821000000000":                 "+821000000000",
+		"tel:+821000000000;phone-cxt=1": "+821000000000",
+		"tel:  +821000000000  ":         "+821000000000",
+		"tel:*23#":                      "*23#",
+		"":                              "",
+		"tel:":                          "",
+		"tel:홍길동":                       "",
+		"tel:+8210000000001234567890123456789012345": "",
+	} {
+		if got := StripURIScheme(input); got != want {
+			t.Errorf("StripURIScheme(%q)=%q want %q", input, got, want)
+		}
+	}
+}
+
+// The caller number is carried, the name never is. The softphone syncs the same
+// contacts and resolves the name itself, so sending it would duplicate the
+// lookup and push contact names onto another device.
+func TestIdentityCarriesOnlyTheNumberAndDiesWithItsCall(t *testing.T) {
+	store := NewStore()
+	if _, err := store.Apply([]byte{2, StateIncoming, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyIncomingCall([]byte{2, '+', '8', '2', '1', '0'}); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Identity(2); got.URI != "+8210" || got.Name != "" {
+		t.Fatalf("uri only: %#v", got)
+	}
+
+	// The snapshot carries it, and the call ending clears it.
+	snapshot := store.Snapshot()
+	if len(snapshot.Calls) != 1 || snapshot.Calls[0].Identity.URI != "+8210" ||
+		snapshot.Calls[0].Identity.Name != "" {
+		t.Fatalf("snapshot identity is wrong: %#v", snapshot.Calls)
+	}
+	if _, err := store.Apply(nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Identity(2); got.URI != "" || got.Name != "" {
+		t.Fatalf("identity outlived its call: %#v", got)
+	}
+	if err := store.ApplyIncomingCall([]byte{0}); err == nil {
+		t.Fatal("accepted call index zero")
+	}
+}
+
+// The peer discards a snapshot whose sequence it has already seen, so every
+// emitted snapshot must advance it. A repeated identity emits nothing at all.
+func TestIdentityChangesAdvanceTheSequenceAndRepeatsDoNot(t *testing.T) {
+	store := NewStore()
+	applied, err := store.Apply([]byte{6, StateIncoming, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequence := applied.Sequence
+
+	if err := store.ApplyIncomingCall(append([]byte{6}, "tel:+8210"...)); err != nil {
+		t.Fatal(err)
+	}
+	afterURI := store.Snapshot().Sequence
+	if afterURI <= sequence {
+		t.Fatalf("a new uri did not advance the sequence: %d -> %d", sequence, afterURI)
+	}
+
+	// Repeating the same value must not spend a sequence number, and must
+	// report that there is nothing to emit.
+	if err := store.ApplyIncomingCall(append([]byte{6}, "tel:+8210"...)); !errors.Is(err, errIdentityUnchanged) {
+		t.Fatalf("repeated uri returned %v", err)
+	}
+	if got := store.Snapshot().Sequence; got != afterURI {
+		t.Fatalf("a repeat advanced the sequence: %d -> %d", afterURI, got)
+	}
+
+	// An empty read on a call with no identity is routine, not an error worth
+	// logging, and emits nothing.
+	if err := store.ApplyIncomingCall(nil); !errors.Is(err, errNoCallIdentity) {
+		t.Fatalf("empty value returned %v", err)
 	}
 }

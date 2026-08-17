@@ -12,7 +12,7 @@ func TestServerConfigurationAndSnapshotEncoding(t *testing.T) {
 	if _, err := NewServer("relative", 0, "00:11:22:33:44:55", func(_ context.Context, _ protocol.Message) error { return nil }, func() gtbs.Snapshot { return gtbs.Snapshot{} }); err == nil {
 		t.Fatal("accepted relative socket")
 	}
-	server, err := NewServer("/tmp/callbridge-lecall-test.sock", 0, "00:11:22:33:44:55",
+	server, err := NewServer("/tmp/lecall-test.sock", 0, "00:11:22:33:44:55",
 		func(_ context.Context, _ protocol.Message) error { return nil },
 		func() gtbs.Snapshot { return gtbs.Snapshot{Sequence: 1} })
 	if err != nil || server.device != "00:11:22:33:44:55" {

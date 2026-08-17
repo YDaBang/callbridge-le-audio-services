@@ -41,7 +41,25 @@ peer UID.  Every media handoff has to carry the token of exactly one live call;
 ambiguous multi-call state fails closed rather than guessing, because the
 process never infers a cellular answer or hangup from media alone.
 
-Three behaviours are worth knowing before you debug something:
+Four behaviours are worth knowing before you debug something:
+
+**The caller's number is forwarded, the caller's name is not.**  GTBS offers
+both — Incoming Call (`0x2BC1`) and Call Friendly Name (`0x2BC2`) — and only the
+first is subscribed.  A softphone that syncs the same address book resolves the
+name from the number itself, so forwarding it would run the same lookup twice
+and put contact names into SIP headers and another device's call history.  It
+also drags in a 44-byte limit that a local lookup does not have.
+
+The URI is reduced to a dialable string or dropped: scheme stripped, parameters
+cut, and anything outside `0-9 + * # -` refused, because a caller ID ends up in
+a SIP header.  A number withheld by the network or the originating server sets
+no URI at all and the module renders `Anonymous`.
+
+The name field remains in the packet format and may be empty, so a deployment
+that does want the name can subscribe `0x2BC2` and fill it without a protocol
+change.  One thing to check first: GTBS reports E.164 (`+8210...`) while an
+address book may hold a national form (`010-...`), and a softphone that does not
+normalise will match neither.
 
 **A call answered on the handset is given back to the phone.**  Android decides
 where call audio goes when an LE Audio device is connected, and it does not

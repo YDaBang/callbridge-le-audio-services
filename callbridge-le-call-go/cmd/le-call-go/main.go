@@ -18,7 +18,7 @@ import (
 	"callbridge.local/callbridge-sms-go/lecall/internal/protocol"
 )
 
-const version = "0.1.0-v35"
+const version = "0.1.0-v39"
 
 type options struct {
 	mode               string

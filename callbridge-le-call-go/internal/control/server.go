@@ -214,9 +214,15 @@ func snapshotMessages(device string, snapshot gtbs.Snapshot) []protocol.Message 
 		if index == len(snapshot.Calls)-1 {
 			flags |= protocol.FlagLast
 		}
+		// An identity that will not encode is dropped rather than allowed to
+		// fail the snapshot: the call matters more than the caller ID.
+		payload, err := protocol.EncodeIdentity(call.Identity)
+		if err != nil {
+			payload = nil
+		}
 		messages = append(messages, protocol.Message{Type: protocol.TypeState, Flags: flags,
 			Sequence: snapshot.Sequence, Token: call.Token, Device: device,
-			Index: call.Index, Code: call.State, Value: call.Flags})
+			Index: call.Index, Code: call.State, Value: call.Flags, Payload: payload})
 	}
 	return messages
 }

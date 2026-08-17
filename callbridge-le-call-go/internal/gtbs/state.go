@@ -3,6 +3,7 @@ package gtbs
 import (
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,10 +25,11 @@ const (
 )
 
 type Call struct {
-	Index byte
-	State byte
-	Flags byte
-	Token uint64
+	Index    byte
+	State    byte
+	Flags    byte
+	Token    uint64
+	Identity protocol.Identity
 }
 
 type Snapshot struct {
@@ -36,12 +38,60 @@ type Snapshot struct {
 }
 
 type Store struct {
-	mu       sync.RWMutex
-	calls    map[byte]Call
-	claimed  map[byte]uint64
-	sequence uint64
-	seed     uint64
-	tokens   atomic.Uint64
+	mu         sync.RWMutex
+	calls      map[byte]Call
+	claimed    map[byte]uint64
+	identities map[byte]protocol.Identity
+	sequence   uint64
+	seed       uint64
+	tokens     atomic.Uint64
+}
+
+// errNoCallIdentity means the characteristic held nothing to attribute, which
+// is what a phone with no call in progress answers a read with.  It is a
+// routine state, not a malformed value.
+var errNoCallIdentity = errors.New("no GTBS call identity")
+
+// errIdentityUnchanged means the value repeated what is already stored, so
+// there is no new snapshot to emit. Re-sending one would reuse the sequence
+// number and the peer would discard it as stale.
+var errIdentityUnchanged = errors.New("GTBS call identity unchanged")
+
+// ParseCallIdentifier splits the [call index][value] shape GTBS Incoming Call
+// (0x2BC1) uses.
+func ParseCallIdentifier(value []byte) (byte, string, error) {
+	if len(value) == 0 || value[0] == 0 {
+		return 0, "", errNoCallIdentity
+	}
+	return value[0], string(value[1:]), nil
+}
+
+// StripURIScheme reduces a GTBS caller URI to the part worth showing.
+//
+// The phone advertises which schemes it supports, so "tel:" is not the only
+// possibility and the scheme has to be found rather than assumed.  Anything
+// that is not a plausible dialable string is dropped: a caller ID is not worth
+// rendering arbitrary text into a SIP header.
+func StripURIScheme(uri string) string {
+	trimmed := strings.TrimSpace(uri)
+	if index := strings.IndexByte(trimmed, ':'); index >= 0 {
+		trimmed = trimmed[index+1:]
+	}
+	if index := strings.IndexAny(trimmed, ";?"); index >= 0 {
+		trimmed = trimmed[:index]
+	}
+	trimmed = strings.TrimSpace(trimmed)
+	if trimmed == "" || len(trimmed) > protocol.IdentityURIMax {
+		return ""
+	}
+	for i := 0; i < len(trimmed); i++ {
+		switch c := trimmed[i]; {
+		case c >= '0' && c <= '9', c == '+', c == '*', c == '#', c == '-':
+		default:
+			return ""
+		}
+	}
+	return trimmed
 }
 
 func NewStore() *Store {
@@ -50,7 +100,7 @@ func NewStore() *Store {
 		seed = 1
 	}
 	store := &Store{calls: make(map[byte]Call), claimed: make(map[byte]uint64),
-		sequence: seed, seed: seed}
+		identities: make(map[byte]protocol.Identity), sequence: seed, seed: seed}
 	store.tokens.Store(seed)
 	return store
 }
@@ -97,11 +147,69 @@ func (s *Store) Apply(value []byte) (Snapshot, error) {
 			delete(s.claimed, index)
 		}
 	}
+	// A caller identity belongs to one call. Leaving it behind would show the
+	// previous caller's name on whatever call reuses the index.
+	for index := range s.identities {
+		if _, present := next[index]; !present {
+			delete(s.identities, index)
+		}
+	}
 	s.sequence++
 	if s.sequence == 0 {
 		s.sequence = 1
 	}
-	return snapshotLocked(s.sequence, s.calls), nil
+	return snapshotLocked(s.sequence, s.calls, s.identities), nil
+}
+
+// ApplyIncomingCall records the caller URI reported for one call.
+func (s *Store) ApplyIncomingCall(value []byte) error {
+	index, raw, err := ParseCallIdentifier(value)
+	if err != nil {
+		return err
+	}
+	uri := StripURIScheme(raw)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	identity := s.identities[index]
+	identity.URI = uri
+	if !s.setIdentityLocked(index, identity) {
+		return errIdentityUnchanged
+	}
+	return nil
+}
+
+// The caller holds s.mu.
+//
+// Returns whether anything changed, so an unchanged identity does not spend a
+// sequence number. The peer treats a repeated sequence as a stale snapshot and
+// discards it, so every snapshot this side emits has to be a new one.
+func (s *Store) setIdentityLocked(index byte, identity protocol.Identity) bool {
+	previous, had := s.identities[index]
+	if identity.URI == "" && identity.Name == "" {
+		if !had {
+			return false
+		}
+		delete(s.identities, index)
+	} else {
+		if had && previous == identity {
+			return false
+		}
+		s.identities[index] = identity
+	}
+	s.sequence++
+	if s.sequence == 0 {
+		s.sequence = 1
+	}
+	return true
+}
+
+// Identity reports what is known about one call's caller: the number, or
+// nothing when it is withheld. The name is deliberately left empty -- the
+// softphone syncs the same contacts and resolves it locally.
+func (s *Store) Identity(index byte) protocol.Identity {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.identities[index]
 }
 
 // HandsetAnswered reports the token of a call the phone answered by itself: an
@@ -139,12 +247,14 @@ func (s *Store) ClaimCall(index byte, token uint64) {
 func (s *Store) Snapshot() Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return snapshotLocked(s.sequence, s.calls)
+	return snapshotLocked(s.sequence, s.calls, s.identities)
 }
 
-func snapshotLocked(sequence uint64, calls map[byte]Call) Snapshot {
+func snapshotLocked(sequence uint64, calls map[byte]Call,
+	identities map[byte]protocol.Identity) Snapshot {
 	snapshot := Snapshot{Sequence: sequence, Calls: make([]Call, 0, len(calls))}
 	for _, call := range calls {
+		call.Identity = identities[call.Index]
 		snapshot.Calls = append(snapshot.Calls, call)
 	}
 	sort.Slice(snapshot.Calls, func(i, j int) bool { return snapshot.Calls[i].Index < snapshot.Calls[j].Index })

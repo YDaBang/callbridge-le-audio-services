@@ -8,9 +8,24 @@ import (
 )
 
 const (
-	Version     = byte(1)
+	// Version 2 carries the caller identity on incoming state messages. There
+	// is no negotiation: a version 1 peer rejects the header outright, which is
+	// the intended behaviour. Both binaries have to be replaced together, and a
+	// mismatch fails loudly instead of dropping identities silently.
+	Version     = byte(2)
 	PacketSize  = 128
 	PayloadSize = PacketSize - 50
+
+	// Identity layout inside a state payload:
+	//
+	//   [0]              uri length   0..IdentityURIMax
+	//   [1 .. n]         uri          scheme stripped, ASCII digits and '+'
+	//   [1+n]            name length  0..IdentityNameMax
+	//   [2+n .. ]        name         UTF-8, cut on a character boundary
+	//
+	// 1 + 32 + 1 + 44 is exactly PayloadSize.
+	IdentityURIMax  = 32
+	IdentityNameMax = 44
 
 	TypeState   = byte(1)
 	TypeCommand = byte(2)
@@ -49,6 +64,60 @@ type Message struct {
 	Code     byte
 	Value    byte
 	Payload  []byte
+}
+
+// Identity is the caller of one call, as far as the phone will say.
+//
+// URI is empty when the number is withheld; Name is empty when the caller is
+// not in the phone's contacts, which is the common case.  Name is never a copy
+// of the number: a phone that answers the friendly-name read with the number
+// itself is treated as having no name, so nothing renders "tel:+82..." where a
+// name belongs.
+type Identity struct {
+	URI  string
+	Name string
+}
+
+func (i Identity) empty() bool { return i.URI == "" && i.Name == "" }
+
+// EncodeIdentity lays an identity out for a state payload.  Callers that have
+// nothing to say send no payload at all.
+func EncodeIdentity(identity Identity) ([]byte, error) {
+	if identity.empty() {
+		return nil, nil
+	}
+	uri := []byte(identity.URI)
+	name := []byte(identity.Name)
+	if len(uri) > IdentityURIMax || len(name) > IdentityNameMax {
+		return nil, errors.New("caller identity exceeds its bound")
+	}
+	payload := make([]byte, 0, 2+len(uri)+len(name))
+	payload = append(payload, byte(len(uri)))
+	payload = append(payload, uri...)
+	payload = append(payload, byte(len(name)))
+	payload = append(payload, name...)
+	return payload, nil
+}
+
+// DecodeIdentity reads back what EncodeIdentity wrote.  An empty payload is a
+// call with no identity, not an error.
+func DecodeIdentity(payload []byte) (Identity, error) {
+	if len(payload) == 0 {
+		return Identity{}, nil
+	}
+	uriLength := int(payload[0])
+	if uriLength > IdentityURIMax || 1+uriLength >= len(payload) {
+		return Identity{}, errors.New("caller identity uri is out of bounds")
+	}
+	nameOffset := 1 + uriLength
+	nameLength := int(payload[nameOffset])
+	if nameLength > IdentityNameMax || nameOffset+1+nameLength != len(payload) {
+		return Identity{}, errors.New("caller identity name is out of bounds")
+	}
+	return Identity{
+		URI:  string(payload[1 : 1+uriLength]),
+		Name: string(payload[nameOffset+1 : nameOffset+1+nameLength]),
+	}, nil
 }
 
 func (m Message) Encode() ([]byte, error) {
@@ -115,15 +184,15 @@ func validate(message Message) error {
 		if message.Flags&FlagSnapshot == 0 {
 			return errors.New("call state is not a full snapshot")
 		}
-		if len(message.Payload) != 0 {
-			return errors.New("state message carries a payload")
-		}
 		if message.Code == NoCallState {
-			if message.Index != 0 || message.Token != 0 || message.Value != 0 {
+			if message.Index != 0 || message.Token != 0 || message.Value != 0 ||
+				len(message.Payload) != 0 {
 				return errors.New("invalid empty call snapshot")
 			}
 		} else if message.Index == 0 || message.Token == 0 || message.Code > 6 || message.Value&^byte(0x07) != 0 {
 			return errors.New("invalid call state message")
+		} else if _, err := DecodeIdentity(message.Payload); err != nil {
+			return err
 		}
 	case TypeCommand:
 		if message.Flags != 0 {

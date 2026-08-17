@@ -157,6 +157,31 @@ func (c *Client) runOnce(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	// A call can already be ringing when the session comes up. Read the identity
+	// characteristics once so it is not left anonymous until the next
+	// notification, which for a ringing call may never come.
+	for uuid, apply := range map[string]func([]byte) error{
+		UUIDIncomingCall: c.store.ApplyIncomingCall,
+	} {
+		characteristic, present := inventory.Characteristics[uuid]
+		if !present || !contains(characteristic.Flags, "read") {
+			continue
+		}
+		identityValue, readErr := readValue(ctx, conn, characteristic.Path)
+		if readErr != nil {
+			c.logger.Printf("gtbs identity read skipped uuid=%s reason=%v", uuid, readErr)
+			continue
+		}
+		if len(identityValue) == 0 {
+			continue
+		}
+		if applyErr := apply(identityValue); applyErr != nil &&
+			!errors.Is(applyErr, errNoCallIdentity) &&
+			!errors.Is(applyErr, errIdentityUnchanged) {
+			c.logger.Printf("gtbs identity read ignored uuid=%s reason=%v", uuid, applyErr)
+		}
+	}
+	snapshot = c.store.Snapshot()
 	c.mu.Lock()
 	c.conn = conn
 	c.inventory = inventory
@@ -246,6 +271,17 @@ func (c *Client) handleSignal(signal *dbus.Signal, inventory Inventory) error {
 		c.emitSnapshot(snapshot)
 	case inventory.Characteristics[UUIDControlPoint].Path:
 		return c.handleControlResult(value)
+	case inventory.Characteristics[UUIDIncomingCall].Path:
+		// A malformed identity is not worth losing the GTBS session over: the
+		// call still works, it just has no caller ID.
+		if err := c.store.ApplyIncomingCall(value); err != nil {
+			if !errors.Is(err, errNoCallIdentity) &&
+				!errors.Is(err, errIdentityUnchanged) {
+				c.logger.Printf("gtbs incoming call identity ignored reason=%v", err)
+			}
+			return nil
+		}
+		c.emitSnapshot(c.store.Snapshot())
 	}
 	return nil
 }
@@ -413,8 +449,18 @@ func readLEBearerConnected(ctx context.Context, conn *dbus.Conn, path dbus.Objec
 	return connected, nil
 }
 
+// notificationPaths lists what to subscribe to.  Call State and the Control
+// Point are the contract; Incoming Call is the caller number and is optional, so
+// a phone that does not expose it keeps working with no caller ID rather than
+// failing to bridge at all.
+//
+// Call Friendly Name (0x2BC2) is deliberately not subscribed.  The softphone
+// syncs the same contacts, so it resolves the number to a name itself; sending
+// the name would duplicate that, push contact names into SIP headers and call
+// logs on another device, and impose a 44-byte limit the local lookup does not
+// have.
 func notificationPaths(inventory Inventory) []dbus.ObjectPath {
-	uuids := []string{UUIDCallState, UUIDControlPoint}
+	uuids := []string{UUIDCallState, UUIDControlPoint, UUIDIncomingCall}
 	paths := make([]dbus.ObjectPath, 0, len(uuids))
 	for _, uuid := range uuids {
 		characteristic, present := inventory.Characteristics[uuid]
