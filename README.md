@@ -7,6 +7,8 @@ unicast stream and its call control reach Asterisk as a SIP trunk.
 
 *한국어: [README.ko.md](README.ko.md)*
 
+**Setting the whole chain up: [BUILDING.md](BUILDING.md).**
+
     callbridge-le-call-go/   LE Audio + cellular call control
     callbridge-sms-go/       MAP/MNS SMS bridge; also holds internal/bluez,
                              the BAP endpoint and LC3 handoff code both use

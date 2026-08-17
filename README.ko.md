@@ -8,6 +8,8 @@ Bluetooth LE Audio 전화 브리지에서 BlueZ와 Asterisk 사이에 놓이는 
 
 *English version: [README.md](README.md)*
 
+**전체 사슬을 세우는 순서: [BUILDING.ko.md](BUILDING.ko.md).**
+
     callbridge-le-call-go/   LE Audio + 이동통신 통화 제어
     callbridge-sms-go/       MAP/MNS SMS 브리지. 양쪽이 함께 쓰는 BAP 엔드포인트와
                              LC3 인계 코드(internal/bluez)도 여기 있습니다
