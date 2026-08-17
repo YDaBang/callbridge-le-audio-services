@@ -36,7 +36,7 @@ func TestDiscoverRequiresWritableNotifiableGTBSControl(t *testing.T) {
 }
 
 func TestDevicePath(t *testing.T) {
-	path, err := DevicePath("hci0", "6c:ac:c2:0d:40:88")
+	path, err := DevicePath("hci0", "00:11:22:33:44:55")
 	if err != nil || path != "/org/bluez/hci0/dev_6C_AC_C2_0D_40_88" {
 		t.Fatalf("path=%q err=%v", path, err)
 	}
@@ -50,7 +50,7 @@ func TestResolveDevicePathUsesStableAddressProperty(t *testing.T) {
 			"Adapter": dbus.MakeVariant(dbus.ObjectPath("/org/bluez/hci0")),
 		}},
 	}
-	got, err := ResolveDevicePath(objects, "hci0", "6c:ac:c2:0d:40:88")
+	got, err := ResolveDevicePath(objects, "hci0", "00:11:22:33:44:55")
 	if err != nil || got != want {
 		t.Fatalf("path=%q err=%v", got, err)
 	}
